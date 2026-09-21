@@ -22,12 +22,18 @@ from .gs1 import GS1ParseError, parse
 from .packing import PackingAuditError, PackingStructureError, audit as packing_audit
 from .pickplan import DemandValidationError, pick_plan
 from .recall import ItemConflictError, RuleValidationError, assess
+from .sampling import (
+    SamplingPlanError,
+    SamplingStructureError,
+    WeightSamplingError,
+    audit as weight_sampling_audit,
+)
 from .summary import WeightSummaryError, summarize
 from .traceaudit import EventConflictError, TraceAuditError, audit
 
 app = FastAPI(
     title="GS1 Element String Parser",
-    version="1.10.0",
+    version="1.11.0",
     description=(
         "Parses GS1 input into structured, ordered AI elements. Accepts raw "
         "scan strings (FNC1 / ASCII 29 separated) and GS1 Digital Link URIs "
@@ -99,7 +105,25 @@ app = FastAPI(
         "rolled up leaves-to-roots with exact Decimal arithmetic; a "
         "container over max_weight is flagged over_limit (with negative "
         "remaining_capacity) without rejecting the request, and the "
-        "response keeps the request order."
+        "response keeps the request order. POST /weight-sampling-audit "
+        "runs a double-sampling acceptance audit over drawn samples: each "
+        "plan is keyed by GTIN + AI 10 batch and declares a closed weight "
+        "interval [min_weight, max_weight] in the target unit plus "
+        "n1/a1/r1 and n2/a2/r2 (n2 > n1, 0 <= a < r <= the stage sample "
+        "size), and every sample names a stage (1 or 2) with a scan "
+        "carrying exactly one AI 01, AI 10, AI 21 and one weight AI; the "
+        "same GTIN+serial may be drawn only once and every sample must "
+        "match a plan. A weight outside the closed interval is a defect: "
+        "once stage 1 holds n1 samples, defects <= a1 accept and defects "
+        ">= r1 reject, otherwise the cumulative count is judged against "
+        "a2/r2 only when both stages together reach n2 (a count still "
+        "between the numbers stays pending), and a stage-1 verdict is "
+        "final. Stage capacity overflow, a missing plan or illegal "
+        "thresholds reject the request with 422 locating the offending "
+        "sample or plan index. All weight conversions and interval "
+        "comparisons use exact Decimal arithmetic and the response keeps "
+        "the per-stage counts, the out-of-interval sample indices and "
+        "the decision of every plan."
     ),
 )
 
@@ -752,6 +776,188 @@ class PackingAuditResponse(BaseModel):
     containers: list[PackingContainerResult]
 
 
+class WeightSamplingPlan(BaseModel):
+    """One double-sampling plan keyed by GTIN + batch with a closed interval."""
+
+    gtin: str = Field(
+        ...,
+        min_length=1,
+        description="GTIN (AI 01 value) the plan applies to; compared literally.",
+        examples=["09501101530003"],
+    )
+    batch: str = Field(
+        ...,
+        min_length=1,
+        description="AI 10 batch/lot the plan applies to.",
+        examples=["B1"],
+    )
+    min_weight: Decimal = Field(
+        ...,
+        description=(
+            "Inclusive lower weight bound in target_unit (an exact Decimal; "
+            "a JSON number or string is accepted). Must not exceed "
+            "max_weight; an inverted interval rejects the request with 422 "
+            "naming the plan_index."
+        ),
+        examples=[1.9],
+    )
+    max_weight: Decimal = Field(
+        ...,
+        description="Inclusive upper weight bound in target_unit.",
+        examples=[2.1],
+    )
+    n1: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "Sample size of stage 1; must be a positive integer and at most "
+            "n1 stage-1 samples may carry stage 1. The relational rules "
+            "(n1 >= 1, 0 <= a1 < r1 <= n1, n2 > n1, 0 <= a2 < r2 <= n2) "
+            "are rejected with 422 naming the plan_index."
+        ),
+        examples=[5],
+    )
+    a1: int = Field(
+        ...,
+        ge=0,
+        description="Stage-1 acceptance number; defects <= a1 after n1 samples accept.",
+        examples=[0],
+    )
+    r1: int = Field(
+        ...,
+        ge=0,
+        description="Stage-1 rejection number; defects >= r1 after n1 samples reject.",
+        examples=[2],
+    )
+    n2: int = Field(
+        ...,
+        ge=0,
+        description="Cumulative sample size of both stages; must be greater than n1.",
+        examples=[10],
+    )
+    a2: int = Field(
+        ...,
+        ge=0,
+        description="Cumulative acceptance number; total defects <= a2 after n2 samples accept.",
+        examples=[1],
+    )
+    r2: int = Field(
+        ...,
+        ge=0,
+        description="Cumulative rejection number; total defects >= r2 after n2 samples reject.",
+        examples=[2],
+    )
+
+
+class WeightSample(BaseModel):
+    """One drawn sample: its double-sampling stage plus a GS1 scan."""
+
+    stage: Literal[1, 2] = Field(
+        ...,
+        description="Sampling stage the item was drawn for: 1 (first stage) or 2 (second stage).",
+        examples=[1],
+    )
+    scan: str = Field(
+        ...,
+        description=(
+            "Raw GS1 scan string or GS1 Digital Link URI; must contain "
+            "exactly one AI 01 (GTIN), exactly one AI 10 (batch/lot), "
+            "exactly one AI 21 (serial number) and exactly one weight AI "
+            "310n/320n. AI 17 is optional."
+        ),
+        examples=["010950110153000310B1\x1d21SN0001\x1d3103002000"],
+    )
+
+
+class WeightSamplingAuditRequest(BaseModel):
+    target_unit: Literal["kg", "lb"] = Field(
+        default="kg",
+        description=(
+            'Unit of the plan intervals and of every weight in the response: '
+            '"kg" or "lb" (default "kg").'
+        ),
+    )
+    plans: list[WeightSamplingPlan] = Field(
+        ...,
+        description=(
+            "Double-sampling plans, each keyed by a unique GTIN+batch pair; "
+            "the response keeps this order."
+        ),
+        examples=[
+            [
+                {
+                    "gtin": "09501101530003",
+                    "batch": "B1",
+                    "min_weight": 1.9,
+                    "max_weight": 2.1,
+                    "n1": 5,
+                    "a1": 0,
+                    "r1": 2,
+                    "n2": 10,
+                    "a2": 1,
+                    "r2": 2,
+                }
+            ]
+        ],
+    )
+    samples: list[WeightSample] = Field(
+        ...,
+        description=(
+            "Drawn samples in inspection order; each names its sampling "
+            "stage and carries a GS1 scan."
+        ),
+        examples=[
+            [
+                {"stage": 1, "scan": "010950110153000310B1\x1d21SN0001\x1d3103002000"}
+            ]
+        ],
+    )
+
+
+class WeightSamplingPlanResult(BaseModel):
+    """OpenAPI shape of one plan's audit; weights render as exact JSON numbers."""
+
+    plan_index: int = Field(description="Position of the plan in the request")
+    gtin: str = Field(description="Echoed plan GTIN")
+    batch: str = Field(description="Echoed plan batch/lot")
+    min_weight: float = Field(
+        description="Echoed inclusive lower bound in the target unit (six decimal places)"
+    )
+    max_weight: float = Field(
+        description="Echoed inclusive upper bound in the target unit (six decimal places)"
+    )
+    unit: Literal["kg", "lb"] = Field(description="Unit of the interval (the target unit)")
+    n1: int = Field(description="Echoed stage-1 sample size")
+    a1: int = Field(description="Echoed stage-1 acceptance number")
+    r1: int = Field(description="Echoed stage-1 rejection number")
+    n2: int = Field(description="Echoed cumulative sample size")
+    a2: int = Field(description="Echoed cumulative acceptance number")
+    r2: int = Field(description="Echoed cumulative rejection number")
+    stage1_count: int = Field(description="Number of stage-1 samples drawn for the plan")
+    stage1_defects: int = Field(description="Out-of-interval samples among stage 1")
+    stage2_count: int = Field(description="Number of stage-2 samples drawn for the plan")
+    stage2_defects: int = Field(
+        description="Out-of-interval samples among stage 2"
+    )
+    total_count: int = Field(description="Samples drawn across both stages")
+    total_defects: int = Field(description="Out-of-interval samples across both stages")
+    out_of_range_samples: list[int] = Field(
+        description="Indices (into the request samples array) whose converted weight fell outside the closed interval"
+    )
+    decision: Literal["accept", "reject", "pending"] = Field(
+        description=(
+            'Double-sampling verdict: "accept"/"reject" once a rule fires, '
+            '"pending" while a stage is incomplete or the count stays '
+            "strictly between the acceptance and rejection numbers"
+        )
+    )
+
+
+class WeightSamplingAuditResponse(BaseModel):
+    target_unit: Literal["kg", "lb"]
+    plans: list[WeightSamplingPlanResult]
+
+
 SIX_PLACES = Decimal("0.000001")
 
 
@@ -932,6 +1138,39 @@ def _build_packing_response(result: dict) -> Response:
     return Response(content=_dump(payload), media_type="application/json")
 
 
+def _build_sampling_response(result: dict) -> Response:
+    """Quantize the interval bounds to six places and render exact JSON."""
+    payload = {
+        "target_unit": result["target_unit"],
+        "plans": [
+            {
+                "plan_index": plan["plan_index"],
+                "gtin": plan["gtin"],
+                "batch": plan["batch"],
+                "min_weight": _six(plan["min_weight"]),
+                "max_weight": _six(plan["max_weight"]),
+                "unit": plan["unit"],
+                "n1": plan["n1"],
+                "a1": plan["a1"],
+                "r1": plan["r1"],
+                "n2": plan["n2"],
+                "a2": plan["a2"],
+                "r2": plan["r2"],
+                "stage1_count": plan["stage1_count"],
+                "stage1_defects": plan["stage1_defects"],
+                "stage2_count": plan["stage2_count"],
+                "stage2_defects": plan["stage2_defects"],
+                "total_count": plan["total_count"],
+                "total_defects": plan["total_defects"],
+                "out_of_range_samples": plan["out_of_range_samples"],
+                "decision": plan["decision"],
+            }
+            for plan in result["plans"]
+        ],
+    }
+    return Response(content=_dump(payload), media_type="application/json")
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -1050,3 +1289,37 @@ def packing_audit_endpoint(req: PackingAuditRequest) -> Response:
     except (PackingAuditError, PackingStructureError) as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
     return _build_packing_response(result)
+
+
+@app.post(
+    "/weight-sampling-audit",
+    response_model=WeightSamplingAuditResponse,
+)
+def weight_sampling_audit_endpoint(req: WeightSamplingAuditRequest) -> Response:
+    try:
+        result = weight_sampling_audit(
+            req.target_unit,
+            [
+                (
+                    plan.gtin,
+                    plan.batch,
+                    plan.min_weight,
+                    plan.max_weight,
+                    plan.n1,
+                    plan.a1,
+                    plan.r1,
+                    plan.n2,
+                    plan.a2,
+                    plan.r2,
+                )
+                for plan in req.plans
+            ],
+            [(sample.stage, sample.scan) for sample in req.samples],
+        )
+    except (
+        SamplingPlanError,
+        WeightSamplingError,
+        SamplingStructureError,
+    ) as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    return _build_sampling_response(result)

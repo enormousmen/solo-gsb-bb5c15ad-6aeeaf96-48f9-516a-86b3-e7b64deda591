@@ -965,6 +965,149 @@ curl -X POST http://localhost:8080/packing-audit \
 }
 ```
 
+## 批次重量双重抽样验收 `POST /weight-sampling-audit`
+
+一次提交一组按 **GTIN + 批号（AI 01 + AI 10）** 定义的验收计划与一组按检验顺序排列的
+抽样样本，执行**双重抽样（double sampling）**判定：每件样本的换算净重落在计划声明的
+**重量闭区间** `[min_weight, max_weight]` 之外（严格小于下限或严格大于上限）计为一个缺陷，
+区间边界本身合格。
+
+- 请求体：`{"target_unit": "kg", "plans": [{...}], "samples": [{"stage": 1, "scan": "..."}]}`。
+  `target_unit` 可选，仅接受 `"kg"` / `"lb"`，默认 `"kg"`；区间上下限与全部重量比较均以
+  该单位计。
+- 每个计划（`plans` 数组）含：`gtin`、`batch`（二者组合**全请求唯一**，重复返回 `422`
+  `DUPLICATE_PLAN`，给出 `plan_index` 与 `first_plan_index`）、`min_weight` /
+  `max_weight`（闭区间上下限，**Decimal**，JSON number 或字符串均可；下限不得大于上限，
+  否则 `422 INVALID_INTERVAL` 并定位 `plan_index`）以及双重抽样参数：
+  - `n1` / `a1` / `r1`：第一阶段样本量、接收数、拒收数；
+  - `n2` / `a2` / `r2`：两阶段**累计**样本量、累计接收数、累计拒收数。
+  必须满足 **`n2 > n1`** 且 **`0 ≤ a1 < r1 ≤ n1`**、**`0 ≤ a2 < r2 ≤ n2`**，任一关系
+  不成立均返回 `422 INVALID_THRESHOLDS`，`detail.plan_index` 定位出错计划，`found`
+  回显六个参数。
+- 每个样本（`samples` 数组）含 `stage`（只能是 `1` 或 `2`）与 `scan`（元素串或
+  GS1 Digital Link URI，规则同 `/parse`）。每条扫码必须包含**恰好一个 AI 01**、
+  **恰好一个 AI 10**、**恰好一个 AI 21** 与**恰好一个重量 AI**（310n/320n，千克/磅
+  可混用）；AI 17 可有可无、至多一个，不参与判定。解析失败或缺/重必需 AI 时整单
+  `422`，`detail.sample_index` 定位出错样本、`detail.error` 为原始扫码错误。
+- 样本结构错误（均为 `422` 并定位索引）：
+  - **同一 GTIN+序列号不得重复**（`DUPLICATE_ITEM`）：`sample_index` 为第二次出现
+    位置、`first_sample_index` 为首次位置（跨阶段重复也算）；
+  - **无匹配计划**（`NO_MATCHING_PLAN`）：样本的 GTIN+批号在 `plans` 中找不到同键
+    计划，`sample_index` 定位样本；
+  - **阶段样本超额**（`STAGE_OVERFLOW`）：同一计划最多 `n1` 个一阶段样本、
+    `n2 - n1` 个二阶段样本（两阶段合计不超过 `n2`），超出的样本触发 `422`，
+    `sample_index` 定位该样本、`plan_index` 定位所属计划。
+- 判定规则（每个计划独立；一阶段结论一旦成立即为**最终结论，二阶段不得改写**）：
+  1. 一阶段抽满 `n1` 件后：缺陷数 `≤ a1` → **接收（accept）**；`≥ r1` → **拒收
+     （reject）**；介于两者之间（严格大于 `a1` 且严格小于 `r1`）则进入二阶段；
+  2. 仅当两阶段**累计抽满 `n2` 件**时，才按累计缺陷数对照 `a2/r2`：`≤ a2` 接收、
+     `≥ r2` 拒收；累计数仍严格介于 `a2` 与 `r2` 之间时保持 `pending`；
+  3. 一阶段未满 `n1`，或一阶段未定论且二阶段累计未满 `n2`，决定均为
+     **待定（pending）**。
+- 重量一律使用 `Decimal` 从**原始六位数字与精度位 n** 重建，按固定系数
+  **1 lb = 0.45359237 kg** 换算到 `target_unit` 后再与区间比较；比较全程不使用
+  float。
+- 响应：`target_unit` 与**按请求顺序**排列的 `plans` 数组，每项回显计划键值、区间、
+  六个抽样参数，以及 `stage1_count` / `stage1_defects`（一阶段样本数与缺陷数）、
+  `stage2_count` / `stage2_defects`（二阶段）、`total_count` / `total_defects`
+  （两阶段累计）、`out_of_range_samples`（越界样本在 `samples` 数组中的下标，按检验
+  顺序排列）与 `decision`（`"accept"` / `"reject"` / `"pending"`）。区间上下限按
+  **六位小数 half-even** 输出为 JSON 数字。`plans` 与 `samples` 均为空时返回 `200`
+  与空数组。
+
+请求示例（计划：区间 `[1.9, 2.1] kg`，`n1=5, a1=0, r1=2`，`n2=10, a2=1, r2=2`；
+一阶段 5 件中 SN04 重 2.5 kg 越界，缺陷数 1 介于 0 与 2 之间进入二阶段；二阶段 5 件
+全部合格，累计 1 个缺陷 `≤ a2`，接收）：
+
+```bash
+curl -X POST http://localhost:8080/weight-sampling-audit \
+  -H "Content-Type: application/json" \
+  -d '{"target_unit": "kg", "plans": [{"gtin": "09501101530003", "batch": "B1", "min_weight": 1.9, "max_weight": 2.1, "n1": 5, "a1": 0, "r1": 2, "n2": 10, "a2": 1, "r2": 2}], "samples": [{"stage": 1, "scan": "010950110153000310B1\u001d21SN01\u001d3103002000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21SN02\u001d3103002000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21SN03\u001d3103001900"}, {"stage": 1, "scan": "010950110153000310B1\u001d21SN04\u001d3103002500"}, {"stage": 1, "scan": "010950110153000310B1\u001d21SN05\u001d3103002100"}, {"stage": 2, "scan": "010950110153000310B1\u001d21SN06\u001d3103002000"}, {"stage": 2, "scan": "010950110153000310B1\u001d21SN07\u001d3103002000"}, {"stage": 2, "scan": "010950110153000310B1\u001d21SN08\u001d3103002000"}, {"stage": 2, "scan": "010950110153000310B1\u001d21SN09\u001d3103002000"}, {"stage": 2, "scan": "010950110153000310B1\u001d21SN10\u001d3103002000"}]}'
+```
+
+注意 SN03 恰为下限 1.900 kg、SN05 恰为上限 2.100 kg，闭区间边界均判合格；SN04
+（2.500 kg）是唯一缺陷。响应 `200 OK`：
+
+```json
+{
+  "target_unit": "kg",
+  "plans": [
+    {
+      "plan_index": 0,
+      "gtin": "09501101530003",
+      "batch": "B1",
+      "min_weight": 1.900000,
+      "max_weight": 2.100000,
+      "unit": "kg",
+      "n1": 5, "a1": 0, "r1": 2, "n2": 10, "a2": 1, "r2": 2,
+      "stage1_count": 5,
+      "stage1_defects": 1,
+      "stage2_count": 5,
+      "stage2_defects": 0,
+      "total_count": 10,
+      "total_defects": 1,
+      "out_of_range_samples": [3],
+      "decision": "accept"
+    }
+  ]
+}
+```
+
+一阶段抽满即定论时结论不可改写：例如一阶段 5 件中 0 个缺陷已接收，之后再抽二阶段
+样本（即使全部越界），`decision` 仍为 `"accept"`，二阶段计数照常体现在响应中。
+一阶段未满 `n1`、或一阶段未定论而累计未满 `n2` 时 `decision` 为 `"pending"`；
+抽满 `n2` 但累计缺陷数仍严格介于 `a2` 与 `r2` 之间（如 `a2=1, r2=3` 时累计 2 个
+缺陷）同样保持 `"pending"`。
+
+阶段样本超额返回 `422`，定位到越额样本与其所属计划（下例为第 6 个一阶段样本，
+一阶段容量为 5）：
+
+```json
+{
+  "detail": {
+    "sample_index": 5,
+    "plan_index": 0,
+    "error": {
+      "error": "STAGE_OVERFLOW",
+      "message": "sample 5: plan 0 (GTIN '09501101530003' batch 'B1') already holds 5 stage-1 samples, which is its stage-1 capacity",
+      "expected": "at most 5 stage-1 sample(s) for this plan",
+      "found": "stage 1 sample number 6"
+    }
+  }
+}
+```
+
+非法阈值、无匹配计划、重复 GTIN+序列号同样返回 `422`；非法阈值定位计划下标，其余
+定位样本下标：
+
+```json
+{
+  "detail": {
+    "plan_index": 0,
+    "error": {
+      "error": "INVALID_THRESHOLDS",
+      "message": "plan 0: n2 must be greater than n1",
+      "expected": "0 <= a1 < r1 <= n1, 0 <= a2 < r2 <= n2 and n2 > n1",
+      "found": {"n1": 5, "a1": 0, "r1": 2, "n2": 5, "a2": 1, "r2": 2}
+    }
+  }
+}
+```
+
+```json
+{
+  "detail": {
+    "sample_index": 0,
+    "error": {
+      "error": "NO_MATCHING_PLAN",
+      "message": "sample 0: no plan matches GTIN '09501101530003' batch 'B2'",
+      "expected": "a plan with the same gtin and batch",
+      "found": "GTIN '09501101530003' batch 'B2'"
+    }
+  }
+}
+```
+
 ## 错误响应
 
 解析或校验失败返回 `422 Unprocessable Entity`，`detail` 中包含错误码、
@@ -1019,7 +1162,7 @@ uvicorn app.main:app --reload --port 8080
 
 ```
 app/
-  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact、/trace-audit、/batch-genealogy、/packing-audit）
+  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact、/trace-audit、/batch-genealogy、/packing-audit、/weight-sampling-audit）
   gs1.py      # GS1 元素串 / Digital Link URI 解析与校验核心：不可变声明式 AI 注册表（精确 AI + 带精度位参数的 310n/320n 族）、两载体共享的最长匹配识别器与值校验分派
   summary.py  # 多扫描重量汇总：Decimal 重建、单位换算、GTIN+批号分组
   pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、as_of+min_remaining_days 效期门槛、按实际效期分配需求；whole 整包模式按单条扫描做最小超量子集选择
@@ -1027,6 +1170,7 @@ app/
   traceaudit.py # 追溯事件审计：GTIN+序列号实物识别、批号/效期一致性校验、receive→pick→ship 状态机与异常记录、最终状态汇总
   genealogy.py # 生产批次谱系审计：GTIN+批号批次台账、一批一产/无来源/循环依赖图校验、稳定拓扑序库存扣减与超耗拒绝、批次最终余量
   packing.py  # 装箱装载审计：容器森林校验（重复容器/未知父容器/环）、GTIN+序列号重复装载检测、叶到根直属与递归重量/货品数汇总、over_limit 超重标记
+  sampling.py # 批次重量双重抽样验收：GTIN+批号计划（闭区间 + n1/a1/r1/n2/a2/r2 阈值校验）、样本唯一 01/10/21/重量 AI 校验与 GTIN+序列号去重、阶段容量与匹配计划校验、一阶段定论优先的 accept/reject/pending 判定
 tests/
   test_parse.py
   test_ai_registry.py       # 不可变注册表：启动期声明校验、只读性与共享识别器（完整键/最长匹配）
@@ -1037,6 +1181,7 @@ tests/
   test_trace_audit.py
   test_batch_genealogy.py
   test_packing_audit.py
+  test_weight_sampling_audit.py
 Dockerfile
 docker-compose.yml
 requirements.txt      # 运行依赖
