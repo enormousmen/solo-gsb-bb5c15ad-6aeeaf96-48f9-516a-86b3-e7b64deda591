@@ -965,6 +965,161 @@ curl -X POST http://localhost:8080/packing-audit \
 }
 ```
 
+## 批次重量双重抽样验收 `POST /weight-sampling-audit`
+
+一次提交一组按 **GTIN（AI 01）+ 批号（AI 10）** 定义的抽样计划（每个计划给出
+重量合格**闭区间**与经典双重抽样参数 `n1/a1/r1/n2/a2/r2`），再提交一批带
+`stage`（1 或 2）的样本扫码；重量落在区间外的样本计为缺陷，按双重抽样规则对每个
+批次给出 `accept` / `reject` / `pending` 决定。
+
+- 请求体：`{"target_unit": "kg", "plans": [...], "samples": [{"stage": 1, "scan": "..."}]}`。
+  `target_unit` 可选，仅接受 `"kg"` / `"lb"`，默认 `"kg"`；`plans` 为计划数组，
+  `samples` 为样本数组，样本按提交顺序（抽样发生顺序）处理；`scan` 既可以是元素串，
+  也可以是 GS1 Digital Link URI（与 `/parse` 完全一致）。
+- 每个计划含：`gtin`、`batch`（二者组合全请求唯一）、`min_weight`、`max_weight`
+  （以 `target_unit` 计的**闭区间**上下界，`Decimal` 精确解析，JSON number 或字符串
+  均可，须满足 `min_weight <= max_weight`）以及六个抽样参数。参数规则（违反任一条均
+  返回 `422`，`detail.plan_index` 定位出错计划，错误码 `INVALID_THRESHOLD`）：
+  - **`n1 >= 1` 且 `n2 > n1`**（`n2` 为两阶段累计样本量）；
+  - **`0 <= a1 < r1 <= n1`** 与 **`0 <= a2 < r2 <= n2`**。
+- 每条样本扫码必须包含**恰好一个 AI 01**、**恰好一个 AI 10**（批号必填——样本按
+  GTIN+批号匹配计划）、**恰好一个 AI 21**（序列号）和**恰好一个重量 AI**（310n/320n，
+  允许混合千克/磅）；AI 17（效期）可有可无、至多一个，出现也忽略。扫码解析失败或
+  缺少/重复必需 AI 时整单返回 `422`，`detail.sample_index` 给出下标，`detail.error`
+  为该条扫码的原始错误（结构同 `/parse`）。
+- 样本的 GTIN+批号必须匹配本请求中的某个计划，否则整单 `422`（`NO_MATCHING_PLAN`，
+  `sample_index` 定位）。同一 **GTIN + 序列号（AI 01 + AI 21）** 在全部样本中只能
+  出现一次（即使属于不同批号/计划），重复时整单 `422`（`DUPLICATE_ITEM`）：
+  `detail.sample_index` 为第二次出现位置，`detail.first_index` 为首次位置。
+- **判定规则**（按样本提交顺序逐计划运行状态机；区间边界本身合格）：
+  - 第一阶段收集满 `n1` 个阶段 1 样本后，缺陷数 **`<= a1` 接收**、**`>= r1` 拒收**，
+    介于两者之间则进入第二阶段；**未满 `n1` 前一律 `pending`**（即使早期缺陷数已达到
+    `r1`，也须等满 `n1` 才能定论）。
+  - 第二阶段只能在第一阶段满 `n1` 且无定论后接收阶段 2 样本；累计样本量达到 `n2`
+    后按两阶段**累计缺陷数**判定：`<= a2` 接收、`>= r2` 拒收，**仍介于两者之间则
+    `pending`**；累计未满 `n2` 也是 `pending`。
+  - **第一阶段一旦定论不得改写**：对已在第一阶段接收/拒收的计划再提交任何样本、阶段 1
+    未满就提交阶段 2 样本、第一阶段无定论后又提交阶段 1 样本、阶段 1 样本超过 `n1`、
+    阶段 2 使累计超过 `n2`（即阶段 2 样本超过 `n2 - n1` 个），均整单 `422`
+    （`STAGE_SAMPLE_OVERFLOW`），`detail.sample_index` 与 `detail.plan_index` 定位。
+- 重量一律使用 `Decimal` 从**原始六位数字与精度位 n** 重建，按固定系数
+  **1 lb = 0.45359237 kg** 换算到 `target_unit` 后再与上下界做**精确闭区间比较**
+  （`min_weight <= 重量 <= max_weight` 为合格）；仅在响应时把回显的区间界按**六位小数
+  half-even（银行家舍入）**输出为 JSON 数字（如 `1.900000`）。
+- 响应：`target_unit` 与**按请求顺序**排列的 `plans` 数组。每项回显 `plan_index`、
+  `gtin`、`batch`、`min_weight`、`max_weight`、`unit` 与六个抽样参数，并给出
+  `stages`（恒为两项，阶段 1 在前）：每阶段含 `stage`、`sample_count`（样本数）、
+  `defect_count`（区间外缺陷数）与 `out_of_range_indices`（该阶段越界样本在 `samples`
+  中的**全局下标**，按提交顺序排列）；`decision` 为 `"accept"` / `"reject"` /
+  `"pending"`。计划无样本或样本不足时返回 `200`，决定为 `pending`、计数为 0；
+  `plans` 与 `samples` 均为空数组时返回 `200` 与空的 `plans`。
+
+请求示例（计划 `n1=5, a1=0, r1=2, n2=10, a2=1, r2=2`，合格区间 1.9–2.1 kg；
+前 5 个阶段 1 样本中 1 个 3 kg 为缺陷——0 < 1 < 2，第一阶段无定论；再抽 5 个阶段 2
+样本全部合格，累计 1 个缺陷 `<= a2=1`，接收）：
+
+```bash
+curl -X POST http://localhost:8080/weight-sampling-audit \
+  -H "Content-Type: application/json" \
+  -d '{"target_unit": "kg", "plans": [{"gtin": "09501101530003", "batch": "B1", "min_weight": 1.9, "max_weight": 2.1, "n1": 5, "a1": 0, "r1": 2, "n2": 10, "a2": 1, "r2": 2}], "samples": [{"stage": 1, "scan": "010950110153000310B1\u001d21SN0\u001d3103002000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21SN1\u001d3103002000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21SN2\u001d3103002000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21SN3\u001d3103002000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21SN4\u001d3103003000"}, {"stage": 2, "scan": "010950110153000310B1\u001d21SN5\u001d3103002000"}, {"stage": 2, "scan": "010950110153000310B1\u001d21SN6\u001d3103002000"}, {"stage": 2, "scan": "010950110153000310B1\u001d21SN7\u001d3103002000"}, {"stage": 2, "scan": "010950110153000310B1\u001d21SN8\u001d3103002000"}, {"stage": 2, "scan": "010950110153000310B1\u001d21SN9\u001d3103002000"}]}'
+```
+
+响应 `200 OK`：
+
+```json
+{
+  "target_unit": "kg",
+  "plans": [
+    {
+      "plan_index": 0,
+      "gtin": "09501101530003",
+      "batch": "B1",
+      "min_weight": 1.900000,
+      "max_weight": 2.100000,
+      "unit": "kg",
+      "n1": 5, "a1": 0, "r1": 2, "n2": 10, "a2": 1, "r2": 2,
+      "stages": [
+        {"stage": 1, "sample_count": 5, "defect_count": 1, "out_of_range_indices": [4]},
+        {"stage": 2, "sample_count": 5, "defect_count": 0, "out_of_range_indices": []}
+      ],
+      "decision": "accept"
+    }
+  ]
+}
+```
+
+第一阶段满 `n1` 且零缺陷时立即接收（区间边界 1.9 kg、2.1 kg 本身合格；缺陷下标为全局
+样本下标）：
+
+```bash
+curl -X POST http://localhost:8080/weight-sampling-audit \
+  -H "Content-Type: application/json" \
+  -d '{"plans": [{"gtin": "09501101530003", "batch": "B1", "min_weight": 1.9, "max_weight": 2.1, "n1": 5, "a1": 0, "r1": 2, "n2": 10, "a2": 1, "r2": 2}], "samples": [{"stage": 1, "scan": "010950110153000310B1\u001d21S0\u001d3104019000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21S1\u001d3104021000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21S2\u001d3103002000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21S3\u001d3103002000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21S4\u001d3103002000"}]}'
+```
+
+```json
+{
+  "target_unit": "kg",
+  "plans": [
+    {
+      "plan_index": 0,
+      "gtin": "09501101530003",
+      "batch": "B1",
+      "min_weight": 1.900000,
+      "max_weight": 2.100000,
+      "unit": "kg",
+      "n1": 5, "a1": 0, "r1": 2, "n2": 10, "a2": 1, "r2": 2,
+      "stages": [
+        {"stage": 1, "sample_count": 5, "defect_count": 0, "out_of_range_indices": []},
+        {"stage": 2, "sample_count": 0, "defect_count": 0, "out_of_range_indices": []}
+      ],
+      "decision": "accept"
+    }
+  ]
+}
+```
+
+样本不足（阶段 1 未满 `n1`）时为 `pending`；同一实物（GTIN+序列号）重复抽样返回
+`422`，当前下标与首次下标一并给出：
+
+```json
+{
+  "detail": {
+    "sample_index": 1,
+    "first_index": 0,
+    "error": {
+      "error": "DUPLICATE_ITEM",
+      "message": "sample 1: item GTIN '09501101530003' serial 'SN1' was already sampled at index 0; the same GTIN+serial may be sampled only once",
+      "expected": "the item first seen at sample 0 to be the only occurrence",
+      "found": "GTIN '09501101530003' serial 'SN1' at sample 1"
+    }
+  }
+}
+```
+
+阶段样本超额（下例第一阶段尚未满 `n1` 就提交阶段 2 样本）返回 `422`，
+`sample_index` 与 `plan_index` 一并定位：
+
+```json
+{
+  "detail": {
+    "sample_index": 1,
+    "plan_index": 0,
+    "error": {
+      "error": "STAGE_SAMPLE_OVERFLOW",
+      "message": "sample 1: plan 0 has collected 1 of n1 = 5 stage-1 samples; a stage-2 sample is accepted only after stage 1 is full and inconclusive",
+      "expected": "4 more stage-1 sample(s) to reach n1 = 5",
+      "found": "stage 2 sample"
+    }
+  }
+}
+```
+
+样本的 GTIN+批号没有对应计划时返回 `422`（`NO_MATCHING_PLAN`）；抽样阈值非法时
+返回 `422`（`INVALID_THRESHOLD`），`plan_index` 定位出错计划；区间倒置
+（`min_weight > max_weight`）返回 `422`（`WEIGHT_RANGE_INVERTED`）；同一
+GTIN+批号重复定义计划返回 `422`（`DUPLICATE_PLAN`，另带 `first_index`）。
+
 ## 错误响应
 
 解析或校验失败返回 `422 Unprocessable Entity`，`detail` 中包含错误码、
@@ -1019,7 +1174,7 @@ uvicorn app.main:app --reload --port 8080
 
 ```
 app/
-  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact、/trace-audit、/batch-genealogy、/packing-audit）
+  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact、/trace-audit、/batch-genealogy、/packing-audit、/weight-sampling-audit）
   gs1.py      # GS1 元素串 / Digital Link URI 解析与校验核心：不可变声明式 AI 注册表（精确 AI + 带精度位参数的 310n/320n 族）、两载体共享的最长匹配识别器与值校验分派
   summary.py  # 多扫描重量汇总：Decimal 重建、单位换算、GTIN+批号分组
   pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、as_of+min_remaining_days 效期门槛、按实际效期分配需求；whole 整包模式按单条扫描做最小超量子集选择
@@ -1027,6 +1182,7 @@ app/
   traceaudit.py # 追溯事件审计：GTIN+序列号实物识别、批号/效期一致性校验、receive→pick→ship 状态机与异常记录、最终状态汇总
   genealogy.py # 生产批次谱系审计：GTIN+批号批次台账、一批一产/无来源/循环依赖图校验、稳定拓扑序库存扣减与超耗拒绝、批次最终余量
   packing.py  # 装箱装载审计：容器森林校验（重复容器/未知父容器/环）、GTIN+序列号重复装载检测、叶到根直属与递归重量/货品数汇总、over_limit 超重标记
+  weightsampling.py # 批次重量双重抽样验收：GTIN+批号计划（闭区间+n1/a1/r1/n2/a2/r2）阈值校验、样本 01/10/21/重量 AI 校验与 GTIN+序列号去重、两阶段接收/拒收/pending 状态机（阶段一终局锁定、阶段超额拒绝）
 tests/
   test_parse.py
   test_ai_registry.py       # 不可变注册表：启动期声明校验、只读性与共享识别器（完整键/最长匹配）
@@ -1037,6 +1193,7 @@ tests/
   test_trace_audit.py
   test_batch_genealogy.py
   test_packing_audit.py
+  test_weight_sampling.py
 Dockerfile
 docker-compose.yml
 requirements.txt      # 运行依赖
